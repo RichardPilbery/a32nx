@@ -54,6 +54,8 @@ export class VnavDriver implements GuidanceComponent {
 
     public activeConstraint: Constraint;
 
+    public atConstraints: AtConstraint[];
+
     public firstDescentConstraintIndex: number;
 
     private fpChecksum: number;
@@ -77,7 +79,10 @@ export class VnavDriver implements GuidanceComponent {
         this.pathExists = false;
 
         // The next constraint
-        this.activeConstraint = {};
+        this.activeConstraint = undefined;
+
+        // The at constraints in the current plan for segment building.
+        this.atConstraints = [];
 
         // The flight plan index of the waypoint with the first descent constraint
         this.firstDescentConstraintIndex = undefined;
@@ -124,14 +129,19 @@ export class VnavDriver implements GuidanceComponent {
     }
 
     buildVerticalFlightPlan(): void {
+        // TODO: IDLE SEGMENT
+
         const waypointCount = this.allWaypoints.length;
 
         this.verticalFlightPlan = [];
-        this.activeConstraint = {};
+        this.atConstraints = [];
+        this.activeConstraint = undefined;
         this.firstDescentConstraintIndex = undefined;
 
         let lastClimbWaypointIndex = 0;
         let firstPossibleDescentWaypointIndex = 0;
+        let firstApproachWaypointIndex = this.getFirstApproachWaypointIndex();
+        let lastApproachWaypointIndex = this.getLastApproachWaypointIndex();
 
         for (let i = 0; i < waypointCount; i++) {
             const segmentType = this.fpm.getSegmentFromWaypoint(this.allWaypoints[i]).type;
@@ -145,10 +155,63 @@ export class VnavDriver implements GuidanceComponent {
             VWP.isAtConstraint = constraints.isAtConstraint;
             VWP.hasConstraint = constraints.hasConstraint;
 
-            // TODO: Constraint logic goes here
+            // Check if current waypoint is the first descent constraint waypoint
+            // If it is, then set the appropriate variable's index to current index
+            if (this.firstDescentConstraintIndex === undefined && !isClimb && constraints.hasConstraint) {
+                this.firstDescentConstraintIndex = i;
+            }
+
+            // If current waypoint is part of approach, turn into "AT" constraint
+            if (firstApproachWaypointIndex !== undefined && i >= firstApproachWaypointIndex && VWP.lowerConstraintAltitude > 0) {
+                VWP.upperConstraintAltitude = constraints.lowerConstraint;
+                VWP.isAtConstraint = true;
+                firstApproachWaypointIndex = undefined;
+                // console.log("setting " + vwp.ident + " as first approach waypoint AT constraint " + constraints.lowerConstraint + "FT");
+            }
+
+            // Assign target altitude if "AT" constraint
+            if (VWP.isAtConstraint || (VWP.hasConstraint && VWP.upperConstraintAltitude < Infinity)) {
+                if (VWP.isAtConstraint) {
+                    VWP.waypointFPTA = VWP.upperConstraintAltitude;
+                }
+                const atConstraint: AtConstraint = {
+                    index: i,
+                    altitude: VWP.upperConstraintAltitude,
+                };
+                // console.log("at constraint " + atConstraint.index + " " + vwp.ident);
+                this.atConstraints.push(atConstraint);
+            }
+
+            // Add vertical waypoint to vertical flight plan and update some index variables
+            this.verticalFlightPlan.push(VWP);
+            lastClimbWaypointIndex = (isClimb && i < lastApproachWaypointIndex) ? i : lastClimbWaypointIndex;
+            firstPossibleDescentWaypointIndex = (isClimb && VWP.hasConstraint && i < lastApproachWaypointIndex) ? i : firstPossibleDescentWaypointIndex;
+
+            const segmentBuildStartIndex = Math.max(this.flightplan.activeWaypointIndex - 1, lastClimbWaypointIndex);
 
             // TODO: Build vertical segments
+            this.verticalFlightPlanSegments = [];
+            const nextSegmentEndIndex = undefined;
+            let segmentIndex = 0;
+            for (let j = lastApproachWaypointIndex; j > segmentBuildStartIndex; j--) {
+                // console.log("j:" + j + ", " + this.verticalFlightPlan[j].ident + " segment:" + this.verticalFlightPlan[j].segment + " FPTA:" + this.verticalFlightPlan[j].waypointFPTA);
+                if (!this.verticalFlightPlan[j].segment && this.verticalFlightPlan[j].waypointFPTA) {
+                    this.verticalFlightPlanSegments.push(this.buildVerticalSegment(segmentIndex, j));
+                    segmentIndex++;
+                }
+            }
+
+            this.lastClimbWaypointIndex = lastClimbWaypointIndex;
+            this.firstPossibleDescentWaypointIndex = firstPossibleDescentWaypointIndex;
+            this.firstPathSegmentIndex = this.verticalFlightPlanSegments.length - 1;
+            const isPath = !(segmentIndex === 0 && nextSegmentEndIndex === undefined);
+
+            // TODO: VNAV STATE
         }
+    }
+
+    buildVerticalSegment(segmentIndex: number, j: number): VerticalSegment {
+        // pass
     }
 
     parseConstraints(waypoint: WayPoint): Constraint {
@@ -191,6 +254,22 @@ export class VnavDriver implements GuidanceComponent {
             break;
         }
         return constraints;
+    }
+
+    getFirstApproachWaypointIndex(): number {
+        const approach = this.fpm.getApproachWaypoints();
+        if (approach && approach.length > 0) {
+            return this.allWaypoints.indexOf(approach[0]);
+        }
+        return undefined;
+    }
+
+    getLastApproachWaypointIndex(): number {
+        const approach = this.fpm.getApproachWaypoints();
+        if (approach && approach.length > 0) {
+            return this.allWaypoints.indexOf(approach[approach.length - 1]);
+        }
+        return undefined;
     }
 }
 
@@ -301,7 +380,68 @@ class VerticalSegment {
 }
 
 class FlightModel {
+    static Cd0 = 0.0237;
+    static wingSpan = 117.5;
+    static wingArea = 1313.2;
+    static wingEffcyFactor = 0.75;
 
+    static getLiftCoefficient(weight: number, mach: number, delta: number): number {
+        return weight / (1481.4 * (mach ** 2) * delta * this.wingArea);
+    }
+
+    /**
+     * Get drag coefficient at given conditions
+     * @param weight in pounds
+     * @param mach self-explanatory
+     * @param delta pressure at the altitude divided by the pressure at sea level
+     * @param spdBrkDeflect Spoiler/speedbrake deflection percentage
+     * @param gearExtPct Gear extension percentage
+     * @param flapAngle Flap angle in radians
+     * @param slatAngle Slat angle in radians
+     * @returns drag coefficient (Cd)
+     */
+    static getDragCoefficient(weight: number, mach: number, delta: number, spdBrkDeflect: number, gearExtPct: number, flapAngle: number, slatAngle: number) : number {
+        const Cl = this.getLiftCoefficient(weight, mach, delta);
+
+        // TODO: Get correct equation somehow, this is not accurate
+        // const baseDrag = this.Cd0 + ((0.8 * Cl) ** 2) / ((this.wingSpan ** 2 / this.wingArea) * Math.PI * Math.E); // TODO: FIX!
+        // const spdBrkDrag = 0.035 * 0.66 * spdBrkDeflect;
+        // const gearExtDrag = 0.045 * gearExtPct;
+        // const flapSlatDrag = 0.046 + (flapAngle * 1.93 * 1.85) + (slatAngle * 1.93);
+
+        return baseDrag + spdBrkDrag + gearExtDrag + flapSlatDrag;
+    }
+
+    /**
+     * Placeholder
+     * @param mach self-explanatory
+     * @param temp actual temperature in Kelvin
+     * @param stdTemp standard day temperature in Kelvin
+     * @returns acceleration factor
+     */
+    static getAccelerationFactorBelowTropo(mach: number, temp: number, stdTemp: number): number {
+        return 1 - (0.133184 * mach ** 2) * (stdTemp / temp);
+    }
+
+    static getAccelerationFactorAboveTropo(mach: number, flyingAtConstantMach: boolean): number {
+        if (flyingAtConstantMach) {
+            return 1;
+        }
+
+        const phi = (((1 + 0.2 * mach ** 2) ** 3.5) - 1) / ((0.7 * mach ** 2) * (1 + 0.2 * mach ** 2) ** 2.5);
+        return 1 + (0.7 * mach ** 2) * phi;
+    }
+
+    static getConstantThrustPathAngle(thrust: number, drag: number, weight: number, Cd: number, Cl: number) {
+        const angle = Math.asin()
+    }
+}
+
+enum VnavState {
+    NONE,
+    REPRESSURIZATION,
+    IDLE,
+    GEOMETRIC
 }
 
 interface Constraint {
@@ -309,4 +449,9 @@ interface Constraint {
     lowerConstraint: number;
     isAtConstraint: boolean;
     hasConstraint: boolean;
+}
+
+interface AtConstraint {
+    index: number;
+    altitude: number;
 }
