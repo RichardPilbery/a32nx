@@ -379,41 +379,65 @@ class VerticalSegment {
     }
 }
 
+const EngineModel {
+
+}
+
 class FlightModel {
     static Cd0 = 0.0237;
+
     static wingSpan = 117.5;
+
     static wingArea = 1313.2;
+
     static wingEffcyFactor = 0.75;
 
-    static getLiftCoefficient(weight: number, mach: number, delta: number): number {
-        return weight / (1481.4 * (mach ** 2) * delta * this.wingArea);
+    /**
+     * Get lift coefficient at given conditions
+     * @param weight in pounds
+     * @param mach self-explanatory
+     * @param delta pressure at the altitude divided by the pressure at sea level
+     * @param loadFactor g-Force
+     * @returns lift coefficient (Cl)
+     */
+    static getLiftCoefficient(weight: number, mach: number, delta: number, loadFactor = 1): number {
+        return (weight * loadFactor) / (1481.4 * (mach ** 2) * delta * this.wingArea);
     }
 
     /**
      * Get drag coefficient at given conditions
+     * TODO: support more mach numbers & flap and gear drag increments
      * @param weight in pounds
      * @param mach self-explanatory
      * @param delta pressure at the altitude divided by the pressure at sea level
-     * @param spdBrkDeflect Spoiler/speedbrake deflection percentage
-     * @param gearExtPct Gear extension percentage
-     * @param flapAngle Flap angle in radians
-     * @param slatAngle Slat angle in radians
+     * @param spdBrkDeflected Whether speedbrake is deflected at half or not
      * @returns drag coefficient (Cd)
      */
-    static getDragCoefficient(weight: number, mach: number, delta: number, spdBrkDeflect: number, gearExtPct: number, flapAngle: number, slatAngle: number) : number {
+    static getDragCoefficient(weight: number, mach: number, delta: number, spdBrkDeflected: boolean) : number {
         const Cl = this.getLiftCoefficient(weight, mach, delta);
 
-        // TODO: Get correct equation somehow, this is not accurate
-        // const baseDrag = this.Cd0 + ((0.8 * Cl) ** 2) / ((this.wingSpan ** 2 / this.wingArea) * Math.PI * Math.E); // TODO: FIX!
-        // const spdBrkDrag = 0.035 * 0.66 * spdBrkDeflect;
-        // const gearExtDrag = 0.045 * gearExtPct;
-        // const flapSlatDrag = 0.046 + (flapAngle * 1.93 * 1.85) + (slatAngle * 1.93);
+        // For mach 0.78 only
+        const cleanConfigDrag = (0.0384 * Cl ** 5) - (0.1385 * Cl ** 4) + (0.1953 * Cl ** 3) - (0.0532 * Cl ** 2) - (0.0052 * Cl) + 0.0259;
 
-        return baseDrag + spdBrkDrag + gearExtDrag + flapSlatDrag;
+        const spdBrkIncrement = spdBrkDeflected ? 0.01 : 0;
+        return cleanConfigDrag + spdBrkIncrement;
     }
 
     /**
-     * Placeholder
+     * Get drag at given conditions
+     * @param weight in pounds
+     * @param mach self-explanatory
+     * @param delta pressure at the altitude divided by the pressure at sea level
+     * @param spdBrkDeflected Whether speedbrake is deflected at half or not
+     * @returns drag
+     */
+    static getDrag(weight: number, mach: number, delta: number, spdBrkDeflected: boolean): number {
+        const Cd = this.getDragCoefficient(weight, mach, delta, spdBrkDeflected);
+        return 1481.4 * (mach ** 2) * delta * this.wingArea * Cd;
+    }
+
+    /**
+     * Gets acceleration factor for altitudes below troposphere
      * @param mach self-explanatory
      * @param temp actual temperature in Kelvin
      * @param stdTemp standard day temperature in Kelvin
@@ -423,6 +447,12 @@ class FlightModel {
         return 1 - (0.133184 * mach ** 2) * (stdTemp / temp);
     }
 
+    /**
+     * Gets acceleration factor for altitudes above troposphere
+     * @param mach self-explanatory
+     * @param flyingAtConstantMach if aircraft is flying at a constant mach
+     * @returns acceleration factor
+     */
     static getAccelerationFactorAboveTropo(mach: number, flyingAtConstantMach: boolean): number {
         if (flyingAtConstantMach) {
             return 1;
@@ -432,8 +462,42 @@ class FlightModel {
         return 1 + (0.7 * mach ** 2) * phi;
     }
 
-    static getConstantThrustPathAngle(thrust: number, drag: number, weight: number, Cd: number, Cl: number) {
-        const angle = Math.asin()
+    static getConstantThrustPathAngle(
+        thrust: number,
+        weight: number,
+        mach: number,
+        drag: number,
+        temp: number,
+        stdTemp: number,
+        altitude: number,
+        tropoAlt: number,
+        flyingAtConstantMach: boolean,
+    ): number {
+        const accelFactor = altitude >= tropoAlt ? this.getAccelerationFactorAboveTropo(mach, flyingAtConstantMach) : this.getAccelerationFactorBelowTropo(mach, temp, stdTemp);
+        return Math.asin(((thrust - drag) / weight) / accelFactor);
+    }
+
+    /**
+     * Gets distance required to accelerate/decelerate
+     * @param thrust 
+     * @param drag 
+     * @param weight in pounds
+     * @param initialSpeed 
+     * @param targetSpeed
+     * @returns distance to accel/decel
+     */
+    static getAccelerationDistance(
+        thrust: number,
+        drag: number,
+        weight: number,
+        initialSpeed: number,
+        targetSpeed: number,
+    ): number {
+        const force = thrust - drag;
+        const accel = force / weight; // TODO: Check units
+        const timeToAccel = (targetSpeed - initialSpeed) / accel;
+        const distanceToAccel = (initialSpeed * timeToAccel) + (0.5 * accel * (timeToAccel ** 2)); // TODO: Check units
+        return distanceToAccel;
     }
 }
 
